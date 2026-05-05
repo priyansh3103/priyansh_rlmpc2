@@ -47,9 +47,6 @@ class ArcLengthPath:
         self.total_length = self.arc_lengths[-1]
         if self.total_length < 1e-6:
             self.total_length = 1.0
-        
-        # Precompute segment midpoints for faster lookup
-        self.segment_midpoints = (self.arc_lengths[:-1] + self.arc_lengths[1:]) / 2.0
     
     def interpolate(self, s):
         """Return (x, y, heading) at arc-length s (wraps around on closed loop)."""
@@ -74,15 +71,20 @@ class ArcLengthPath:
         heading = np.arctan2(p_b[1] - p_a[1], p_b[0] - p_a[0])
         return x, y, heading
     
-    def find_closest_arc_length_local(self, x, y, s_hint):
-        """Fast local search with limited window."""
-        search_window = max(8.0, self.total_length * 0.12)
-        best_s = s_hint
+    def find_closest_arc_length_fast(self, x, y, s_hint=None):
+        """Fast arc-length search using local hint + global fallback."""
+        if s_hint is None:
+            s_hint = 0.0
+        
+        # Local search first
+        search_window = max(10.0, self.total_length * 0.15)
+        best_s = None
         best_d = float('inf')
         
-        # Search only nearby segments
         for i in range(self.n - 1):
-            s_mid = self.segment_midpoints[i]
+            s_mid = (self.arc_lengths[i] + self.arc_lengths[i+1]) / 2.0
+            
+            # Check if segment is in local window
             dist_to_hint = abs(s_mid - s_hint)
             wrapped_dist = min(dist_to_hint, self.total_length - dist_to_hint)
             if wrapped_dist > search_window:
@@ -102,47 +104,17 @@ class ArcLengthPath:
             
             if d < best_d:
                 best_d = d
-                best_s = self.arc_lengths[i] + t * (self.arc_lengths[i+1] - self.arc_lengths[i])
+                s_interp = self.arc_lengths[i] + t * (self.arc_lengths[i+1] - self.arc_lengths[i])
+                best_s = s_interp
         
-        return best_s
-    
-    def find_closest_arc_length(self, x, y, s_hint=None):
-        """Fast arc-length search with local-first strategy."""
-        if s_hint is not None and abs(self.waypoints[0][0] - x) < 20 and abs(self.waypoints[0][1] - y) < 20:
-            # Try local search first (fast path)
-            return self.find_closest_arc_length_local(x, y, s_hint)
+        # If local search found a close point, use it
+        if best_d < 3.0:
+            return best_s
         
-        # Fallback: grid-based global search with early exit
+        # Fallback: global search
         best_s = 0.0
         best_d = float('inf')
-        step = max(1, self.n // 50)  # Sample every Nth point initially
-        
-        for i in range(0, self.n - 1, step):
-            p_a = self.waypoints[i]
-            p_b = self.waypoints[i+1]
-            ab = p_b - p_a
-            ap = np.array([x, y], dtype=float) - p_a
-            denom = np.dot(ab, ab)
-            if denom < 1e-12:
-                t = 0.0
-            else:
-                t = np.clip(np.dot(ap, ab) / denom, 0.0, 1.0)
-            closest = p_a + t * ab
-            d = np.linalg.norm(np.array([x, y], dtype=float) - closest)
-            
-            if d < best_d:
-                best_d = d
-                best_s = self.arc_lengths[i] + t * (self.arc_lengths[i+1] - self.arc_lengths[i])
-        
-        # Refine in window around best
-        window_rad = max(2.0, self.total_length * 0.05)
         for i in range(self.n - 1):
-            s_mid = self.segment_midpoints[i]
-            dist_to_best = abs(s_mid - best_s)
-            wrapped_dist = min(dist_to_best, self.total_length - dist_to_best)
-            if wrapped_dist > window_rad:
-                continue
-            
             p_a = self.waypoints[i]
             p_b = self.waypoints[i+1]
             ab = p_b - p_a
@@ -157,30 +129,30 @@ class ArcLengthPath:
             
             if d < best_d:
                 best_d = d
-                best_s = self.arc_lengths[i] + t * (self.arc_lengths[i+1] - self.arc_lengths[i])
+                s_interp = self.arc_lengths[i] + t * (self.arc_lengths[i+1] - self.arc_lengths[i])
+                best_s = s_interp
         
         return best_s
 
 
 class PathFollower:
-    """Fast arc-length MPC with reduced horizon and optimization steps."""
+    """Arc-length parameterized MPC path tracker with fast convergence."""
     
     def __init__(self):
         self.max_steer = 0.5
         self.max_steer_rate = 0.35
         self.max_accel = 1.8
         
-        # Aggressive reduction for speed
-        self.horizon_steps = 4
-        self.max_iter = 10
+        self.horizon_steps = 5
+        self.max_iter = 15
         self.control_dt = 0.05
         
-        self.w_lateral = 1.6
-        self.w_heading = 1.4
-        self.w_speed = 0.6
+        self.w_lateral = 1.8
+        self.w_heading = 1.6
+        self.w_speed = 0.7
         self.w_steer = 0.10
-        self.w_input_rate = 0.7
-        self.w_forward = 1.8
+        self.w_input_rate = 0.8
+        self.w_forward = 2.0
         
         self.target_speed = 2.2
         self.turn_speed = 1.6
@@ -189,7 +161,7 @@ class PathFollower:
         self.prev_delta = 0.0
         self.prev_a = 0.0
         self._warm_start = None
-        self.last_s = 0.0
+        self.last_s = None
     
     def set_path(self, waypoints):
         """Initialize arc-length path."""
@@ -221,11 +193,11 @@ class PathFollower:
     
     def _target_speed(self, s):
         """Adaptive target speed."""
-        delta_s = 0.7
+        delta_s = 0.5
         _, _, h1 = self.path.interpolate(s - delta_s)
         _, _, h2 = self.path.interpolate(s + delta_s)
         heading_change = abs(self._wrap_angle(h2 - h1))
-        if heading_change > 0.22:
+        if heading_change > 0.25:
             return self.turn_speed
         return self.target_speed
     
@@ -246,25 +218,27 @@ class PathFollower:
             delta = float(d_seq[k])
             state = self._predict_step(state, a, delta, wheelbase, dt)
             
-            # Fast arc-length search with hint
-            s_new = self.path.find_closest_arc_length(state[0], state[1], s_hint=s)
+            # Fast arc-length search using hint
+            s_new = self.path.find_closest_arc_length_fast(state[0], state[1], s_hint=s)
             
-            # Forward progress (simplified)
+            # Forward progress
             forward_progress = s_new - s
-            if abs(forward_progress) > self.path.total_length * 0.4:
-                forward_progress = np.sign(forward_progress) * (self.path.total_length - abs(forward_progress))
+            if forward_progress < -self.path.total_length / 2:
+                forward_progress += self.path.total_length
+            elif forward_progress > self.path.total_length / 2:
+                forward_progress -= self.path.total_length
             
             # Frenet errors
             lateral, heading_err = self._frenet_error(state[0], state[1], state[2], s_new)
             ref_speed = self._target_speed(s_new)
-            speed_err = 0.5 * (state[3] - ref_speed) ** 2
+            speed_err = (state[3] - ref_speed) ** 2
             
             cost += (
                 self.w_lateral * (lateral ** 2)
                 + self.w_heading * (heading_err ** 2)
                 + self.w_speed * speed_err
                 + self.w_steer * abs(delta)
-                + 0.06 * abs(a)
+                + 0.08 * abs(a)
                 + self.w_input_rate * (abs(a - last_a) + abs(delta - last_d))
                 - self.w_forward * forward_progress
             )
@@ -283,7 +257,10 @@ class PathFollower:
         state0 = np.array([vehicle.x, vehicle.y, vehicle.theta, vehicle.v], dtype=float)
         
         # Find arc-length with hint from last iteration
-        s0 = self.path.find_closest_arc_length(vehicle.x, vehicle.y, s_hint=self.last_s)
+        if self.last_s is None:
+            s0 = self.path.find_closest_arc_length_fast(vehicle.x, vehicle.y)
+        else:
+            s0 = self.path.find_closest_arc_length_fast(vehicle.x, vehicle.y, s_hint=self.last_s)
         
         horizon = self.horizon_steps
         if self._warm_start is None or len(self._warm_start) != 2 * horizon:
@@ -308,7 +285,7 @@ class PathFollower:
                 u0,
                 method="L-BFGS-B",
                 bounds=bounds,
-                options={"maxiter": self.max_iter, "ftol": 5e-3},
+                options={"maxiter": self.max_iter, "ftol": 1e-3},
             )
             u_opt = result.x if result.success and result.x is not None else u0
         except Exception:
@@ -337,24 +314,4 @@ class PathFollower:
         self.prev_delta = 0.0
         self.prev_a = 0.0
         self._warm_start = None
-        self.last_s = 0.0
-    
-    def _target_speed_from_curvature(self, waypoints, segment_index):
-        """Compute target speed based on path curvature (for evaluator compatibility)."""
-        if segment_index < 0 or segment_index >= len(waypoints) - 1:
-            return self.target_speed
-        
-        p0 = np.array(waypoints[segment_index], dtype=float)
-        p1 = np.array(waypoints[segment_index + 1], dtype=float)
-        p2 = np.array(waypoints[min(segment_index + 2, len(waypoints) - 1)], dtype=float)
-        
-        h1 = np.arctan2((p1 - p0)[1], (p1 - p0)[0])
-        h2 = np.arctan2((p2 - p1)[1], (p2 - p1)[0])
-        
-        def wrap_angle(ang):
-            return (ang + np.pi) % (2 * np.pi) - np.pi
-        
-        heading_change = abs(wrap_angle(h2 - h1))
-        if heading_change > 0.25:
-            return self.turn_speed
-        return self.target_speed
+        self.last_s = None

@@ -1,38 +1,50 @@
-# roads.py
-# SIMPLE 4-ZONE PARKING LOT (matches reference image)
-# Layout:
-#   ┌─────────────────┬─────────────────┐
-#   │                 │                 │
-#   │     ZONE 1      │     ZONE 2      │  (y = 0 to 25)
-#   │                 │                 │
-#   ├─────────────────┼─────────────────┤
-#   │                 │                 │
-#   │     ZONE 3      │     ZONE 4      │  (y = -25 to 0)
-#   │                 │                 │
-#   └─────────────────┴─────────────────┘
-#   x = -25 to 0     x = 0 to 25
+"""Connector-free lane map.
 
-ROADS = [
-    # ============ OUTER PERIMETER ============
-    # Forms a rectangle boundary
-    ("line", (-25, -25), (25, -25)),   # Bottom edge
-    ("line", (25, -25), (25, 25)),     # Right edge
-    ("line", (25, 25), (-25, 25)),     # Top edge
-    ("line", (-25, 25), (-25, -25)),   # Left edge
+Road tuple formats:
+- ("line", start, end) -> defaults to kind "lane"
+- ("line", start, end, kind)
 
-    # ============ MAIN DIVIDING ROADS ============
-    # Horizontal divider (separates top and bottom zones)
-    ("line", (-25, 0), (25, 0)),
+Kinds used in this file:
+- "lane": drivable regular lanes
+- "outer_loop": single-lane perimeter loop
+"""
 
-    # Vertical divider (separates left and right zones)
-    ("line", (0, -25), (0, 25)),
 
-    # ============ INNER ZONE ROADS (optional for more paths) ============
-    # Horizontal inner roads
-    ("line", (-25, 12.5), (25, 12.5)),   # Upper inner horizontal
-    ("line", (-25, -12.5), (25, -12.5)), # Lower inner horizontal
+def _add_polyline(roads, points, kind="lane"):
+    for i in range(len(points) - 1):
+        roads.append(("line", points[i], points[i + 1], kind))
 
-    # Vertical inner roads
-    ("line", (-12.5, -25), (-12.5, 25)), # Left inner vertical
-    ("line", (12.5, -25), (12.5, 25)),   # Right inner vertical
-]
+
+def _add_rounded_rect_loop(roads, cx, cy, hx, hy, chamfer=3.0, kind="lane"):
+    c = chamfer
+    pts = [
+        (cx - hx + c, cy + hy),
+        (cx + hx - c, cy + hy),
+        (cx + hx, cy + hy - c),
+        (cx + hx, cy - hy + c),
+        (cx + hx - c, cy - hy),
+        (cx - hx + c, cy - hy),
+        (cx - hx, cy - hy + c),
+        (cx - hx, cy + hy - c),
+        (cx - hx + c, cy + hy),
+    ]
+    _add_polyline(roads, pts, kind)
+
+
+ROADS = []
+
+zone_centers = [(-12.0, 12.0), (12.0, 12.0), (-12.0, -12.0), (12.0, -12.0)]
+
+# Two parallel hugging lanes per zone (no explicit connector segments).
+for cx, cy in zone_centers:
+    _add_rounded_rect_loop(ROADS, cx, cy, hx=8.5, hy=8.5, chamfer=2.5, kind="lane")
+    _add_rounded_rect_loop(ROADS, cx, cy, hx=6.5, hy=6.5, chamfer=2.0, kind="lane")
+
+# Shared central intersection with two lanes per direction.
+_add_polyline(ROADS, [(-20.0, 1.5), (20.0, 1.5)], kind="lane")
+_add_polyline(ROADS, [(-20.0, -1.5), (20.0, -1.5)], kind="lane")
+_add_polyline(ROADS, [(1.5, -20.0), (1.5, 20.0)], kind="lane")
+_add_polyline(ROADS, [(-1.5, -20.0), (-1.5, 20.0)], kind="lane")
+
+# Single-lane outer ring that hugs zone outer lanes (3 units offset).
+_add_rounded_rect_loop(ROADS, 0.0, 0.0, hx=23.5, hy=23.5, chamfer=5.0, kind="outer_loop")

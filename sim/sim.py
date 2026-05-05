@@ -1,6 +1,5 @@
 import pygame
 import numpy as np
-import random
 
 from vehicle import Vehicle
 from world import World
@@ -10,7 +9,7 @@ from roads import ROADS
 
 # ---- CONFIG ----
 WIDTH, HEIGHT = 800, 800
-SCALE = 10
+SCALE = 15
 DT = 0.05
 
 
@@ -38,8 +37,8 @@ def get_color(i):
 # ---------- VEHICLE DRAW ----------
 def draw_vehicle(screen, vehicle, color, vehicle_id=0):
     """Enhanced vehicle visualization with state indicators"""
-    car_length = 5  # Increased from 4
-    car_width = 2.5  # Increased from 2
+    car_length = 2.6
+    car_width = 1.1
 
     corners = np.array([
         [0, -car_width/2],
@@ -103,31 +102,71 @@ def draw_vehicle(screen, vehicle, color, vehicle_id=0):
 
 # ---------- MAP ----------
 def draw_roads(screen):
-    road_width = 6
-    half = int((road_width / 2) * SCALE)
-    color = (80, 80, 80)
+    styles = {
+        "lane": {"color": (92, 92, 92), "width": max(2, int(1.6 * SCALE))},
+        "outer_loop": {"color": (96, 96, 96), "width": max(2, int(1.7 * SCALE))},
+    }
 
-    for road in ROADS:
-        if road[0] == "line":
-            _, start, end = road
+    draw_order = ["lane", "outer_loop"]
+
+    for kind in draw_order:
+        style = styles[kind]
+        for road in ROADS:
+            if not road or road[0] != "line":
+                continue
+
+            if len(road) == 4:
+                _, start, end, rkind = road
+            else:
+                _, start, end = road
+                rkind = "lane"
+
+            if rkind != kind:
+                continue
 
             x1, y1 = world_to_screen(start[0], start[1])
             x2, y2 = world_to_screen(end[0], end[1])
+            pygame.draw.line(screen, style["color"], (x1, y1), (x2, y2), style["width"])
 
-            if x1 == x2:
-                # vertical
-                pygame.draw.rect(
-                    screen,
-                    color,
-                    (x1 - half, min(y1, y2), 2 * half, abs(y2 - y1))
-                )
-            else:
-                # horizontal
-                pygame.draw.rect(
-                    screen,
-                    color,
-                    (min(x1, x2), y1 - half, abs(x2 - x1), 2 * half)
-                )
+def draw_lane_markings(screen):
+    """Draw dashed separators between the two central lanes."""
+    marking_color = (115, 115, 115)
+    dash_length = 6
+    gap_length = 6
+    line_width = 1
+
+    # Dashed separator between horizontal central lanes (y=0).
+    x_left = world_to_screen(-20, 0)[0]
+    x_right = world_to_screen(20, 0)[0]
+    y_mid = world_to_screen(0, 0)[1]
+
+    x = x_left
+    while x < x_right:
+        pygame.draw.line(
+            screen,
+            marking_color,
+            (int(x), y_mid),
+            (int(min(x + dash_length, x_right)), y_mid),
+            line_width,
+        )
+        x += dash_length + gap_length
+
+    # Dashed separator between vertical central lanes (x=0).
+    y_top = world_to_screen(0, 20)[1]
+    y_bottom = world_to_screen(0, -20)[1]
+    x_mid = world_to_screen(0, 0)[0]
+
+    y = y_bottom
+    while y > y_top:
+        pygame.draw.line(
+            screen,
+            marking_color,
+            (x_mid, int(y)),
+            (x_mid, int(max(y - dash_length, y_top))),
+            line_width,
+        )
+        y -= dash_length + gap_length
+
 
 def draw_outer_loop(screen):
     pygame.draw.rect(screen, (80, 80, 80), (100, 100, WIDTH - 200, HEIGHT - 200), 40)
@@ -153,6 +192,21 @@ def draw_hud(screen, vehicles):
         y_offset += 20
 
 
+def draw_patrol_status(screen, patrol_state):
+    """Display deterministic patrol progress."""
+    if not patrol_state:
+        return
+
+    font_small = pygame.font.Font(None, 20)
+    txt = (
+        f"PATROL: {patrol_state['name']} | "
+        f"progress_idx={patrol_state['path_index']} | "
+        f"loops={patrol_state['loops_completed']}"
+    )
+    surf = font_small.render(txt, True, (220, 220, 220))
+    screen.blit(surf, (10, 80))
+
+
 
 # ---------- PATH ----------
 def draw_path(screen, path, color):
@@ -176,82 +230,89 @@ def draw_collision_debug(screen, world):
 
 # ---------- ROAD CHECK ----------
 def is_on_road(x, y):
-    road_width = 3
+    road_half_width = 1.8
+    p = np.array([x, y], dtype=float)
 
-    if abs(y - 0) < road_width or abs(y - 10) < road_width or abs(y + 10) < road_width:
-        return True
+    for road in ROADS:
+        if road[0] != "line":
+            continue
 
-    if abs(x - 0) < road_width or abs(x - 10) < road_width or abs(x + 10) < road_width:
-        return True
+        if len(road) >= 4:
+            _, start, end, _ = road
+        else:
+            _, start, end = road
+        a = np.array(start, dtype=float)
+        b = np.array(end, dtype=float)
+        ab = b - a
+        ab_norm_sq = float(np.dot(ab, ab))
 
-    if abs(abs(x) - 20) < road_width or abs(abs(y) - 20) < road_width:
-        return True
+        if ab_norm_sq < 1e-12:
+            continue
+
+        t = float(np.dot(p - a, ab) / ab_norm_sq)
+        t = np.clip(t, 0.0, 1.0)
+        proj = a + t * ab
+
+        if np.linalg.norm(p - proj) <= road_half_width:
+            return True
 
     return False
 
 
-# ---------- GOAL ----------
-def assign_new_goal(vehicle, graph):
-    """
-    Assign next goal with improved logic to avoid sharp U-turns.
-    """
-    start = graph.get_closest_node((vehicle.x, vehicle.y))
+def plan_path(graph, start_xy, goal_xy, interp=18):
+    start = graph.get_closest_node(start_xy)
+    goal = graph.get_closest_node(goal_xy)
+    discrete = graph.astar(start, goal)
+    return graph.interpolate_waypoints(discrete, num_points=interp)
 
-    forward = np.array([np.cos(vehicle.theta), np.sin(vehicle.theta)])
 
-    valid_goals = []
-    for g in graph.nodes:
-        direction = np.array([g[0] - vehicle.x, g[1] - vehicle.y])
-        distance = np.linalg.norm(direction)
+def create_patrol_mission(name="outer_loop"):
+    """Deterministic looping missions using fixed checkpoints."""
+    if name == "upper_zone":
+        checkpoints = [(-17.0, 19.0), (-7.0, 19.0), (-5.0, 12.0), (-7.0, 5.0), (-17.0, 5.0), (-19.0, 12.0)]
+    elif name == "center_cross":
+        checkpoints = [(-12.0, 1.5), (0.0, 1.5), (12.0, 1.5), (12.0, -1.5), (0.0, -1.5), (-12.0, -1.5)]
+    elif name == "zone_outer_mix":
+        # Alternates between zone lanes and nearby outer-loop lanes.
+        checkpoints = [
+            (-17.0, 19.0), (-18.5, 23.5),
+            (17.0, 19.0), (23.5, 18.5),
+            (17.0, -19.0), (18.5, -23.5),
+            (-17.0, -19.0), (-23.5, -18.5),
+        ]
+    else:
+        # Default: perimeter patrol on outer loop.
+        checkpoints = [
+            (-18.5, 23.5), (18.5, 23.5), (23.5, 18.5), (23.5, -18.5),
+            (18.5, -23.5), (-18.5, -23.5), (-23.5, -18.5), (-23.5, 18.5),
+        ]
 
-        # Filters
-        if distance < 5:
-            continue  # too close
-        
-        if distance > 50:
-            continue  # too far
+    return {
+        "name": name,
+        "checkpoints": checkpoints,
+        "path_index": 0,
+        "loops_completed": 0,
+    }
 
-        direction_normalized = direction / distance
 
-        # Forward bias: prefer goals more than 60° forward
-        # (increased from just any positive dot product)
-        forward_bias = np.dot(forward, direction_normalized)
-        
-        if forward_bias > 0.5:  # ~60° forward
-            valid_goals.append(g)
+def build_patrol_loop_path(graph, checkpoints):
+    """Build one closed-loop path by concatenating A* segments."""
+    if len(checkpoints) < 2:
+        return []
 
-    # If no strictly forward goals, relax to 0° (any direction ahead)
-    if not valid_goals:
-        for g in graph.nodes:
-            direction = np.array([g[0] - vehicle.x, g[1] - vehicle.y])
-            distance = np.linalg.norm(direction)
-
-            if distance < 5 or distance > 50:
-                continue
-
-            direction_normalized = direction / distance
-            forward_bias = np.dot(forward, direction_normalized)
-            
-            if forward_bias > 0.0:
-                valid_goals.append(g)
-
-    # If still nothing, pick any node
-    if not valid_goals:
-        valid_goals = graph.nodes
-
-    goal = random.choice(valid_goals)
-
-    # Plan path using A*
-    discrete_path = graph.astar(start, goal)
-    
-    # Convert to smooth waypoint trajectory
-    path = graph.interpolate_waypoints(discrete_path, num_points=15)
-
-    # Enforce minimum path length (now measured in waypoints)
-    if len(path) < 10:
-        return assign_new_goal(vehicle, graph)
-
-    return path
+    full = []
+    n = len(checkpoints)
+    for i in range(n):
+        s = checkpoints[i]
+        e = checkpoints[(i + 1) % n]
+        seg = plan_path(graph, s, e, interp=10)
+        if not seg:
+            continue
+        if full and seg[0] == full[-1]:
+            full.extend(seg[1:])
+        else:
+            full.extend(seg)
+    return full
 
 
 
@@ -268,14 +329,16 @@ def main():
     controller = PathFollower()
 
     vehicles = [
-        Vehicle(-15, 0, 0, 0),  # Single vehicle starting at left-center
+        Vehicle(-23.5, 0.0, np.pi / 2.0, 0.0),
     ]
 
     for v in vehicles:
         world.add_vehicle(v)
 
-    paths = [assign_new_goal(v, graph) for v in vehicles]
-    indices = [0 for _ in vehicles]
+    patrol_state = create_patrol_mission(name="zone_outer_mix")
+    loop_path = build_patrol_loop_path(graph, patrol_state["checkpoints"])
+    paths = [loop_path]
+    indices = [0]
 
     running = True
     while running:
@@ -294,10 +357,11 @@ def main():
             # goal check
             if path:
                 goal = path[-1]
-                if np.hypot(v.x - goal[0], v.y - goal[1]) < 2.0:
-                    path = assign_new_goal(v, graph)
-                    controller.reset_pid()  # Reset PID for new path
-                    paths[i] = path
+                # Wrap loop deterministically when nearing end of closed path.
+                patrol_state["path_index"] = idx
+                if idx >= len(path) - 15 and np.hypot(v.x - goal[0], v.y - goal[1]) < 3.0:
+                    patrol_state["loops_completed"] += 1
+                    controller.reset_pid()
                     idx = 0
 
             a, d, idx = controller.control(v, path, idx, dt=DT)
@@ -313,6 +377,7 @@ def main():
         screen.fill((20, 20, 20))
 
         draw_roads(screen)
+        draw_lane_markings(screen)
         #draw_outer_loop(screen)
 
         for i, v in enumerate(world.vehicles):
@@ -333,6 +398,7 @@ def main():
 
         # Draw HUD
         draw_hud(screen, world.vehicles)
+        draw_patrol_status(screen, patrol_state)
 
         pygame.display.flip()
 
